@@ -168,20 +168,18 @@ const normalizeZooplaAgent = (agent, source) => {
         }
     }
 
-    // Extract logo URL properly (can be string or object with src/url)
+    // Extract logo URL properly - Zoopla uses { uri, width, height } structure
     let logoUrl = null;
     if (agent.logo) {
         if (typeof agent.logo === 'string') {
             logoUrl = agent.logo;
         } else if (typeof agent.logo === 'object') {
-            logoUrl = agent.logo.src || agent.logo.url || agent.logo.href || agent.logo.image || null;
+            // Zoopla specifically uses 'uri' for the image URL
+            logoUrl = agent.logo.uri || agent.logo.src || agent.logo.url || agent.logo.href || null;
         }
     }
-    // Ensure logo has proper extension or is a valid URL
     if (logoUrl && typeof logoUrl === 'string') {
         logoUrl = ensureAbsoluteUrl(logoUrl);
-        // If URL doesn't have an image extension but looks like a URL, keep it
-        // Some CDNs serve images without extensions
     }
 
     // Extract rating from various possible locations
@@ -420,7 +418,7 @@ try {
             sessionOptions: {
                 maxUsageCount: 3,
             },
-            blockedStatusCodes: [403, 429, 503],
+            // Note: Removed blockedStatusCodes to avoid conflict with retryOnBlocked
         },
         requestHandlerTimeoutSecs: 180,
         navigationTimeoutSecs: 120,
