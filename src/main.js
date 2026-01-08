@@ -1,15 +1,18 @@
 /**
- * Zoopla Agent Scraper - Production Ready v1.0.0
+ * Zoopla Agent Scraper - Production Ready v2.0.0
  *
- * Updates:
- * - Targets estate agent listings instead of properties
- * - API-first extraction with JSON parsing
- * - JSON-LD + HTML fallbacks
- * - Pagination tuned for agent directory pages
+ * Features:
+ * - HTTP-first with got-scraping (Priority 1: JSON API)
+ * - __NEXT_DATA__ extraction from correct path
+ * - /_next/data/{buildId}/ JSON API for pagination
+ * - Playwright/Camoufox fallback for Cloudflare bypass
+ * - JSON-LD + HTML fallbacks (Priority 2)
+ * - Full stealth: User-Agent rotation, delays, session persistence
  */
 
 import { PlaywrightCrawler } from '@crawlee/playwright';
 import { Actor, Dataset, log } from 'apify';
+import { gotScraping } from 'got-scraping';
 import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
 import { firefox } from 'playwright';
 import { load as cheerioLoad } from 'cheerio';
@@ -20,13 +23,27 @@ import { load as cheerioLoad } from 'cheerio';
 const BASE_URL = 'https://www.zoopla.co.uk';
 const DEFAULT_START_URL = 'https://www.zoopla.co.uk/find-agents/estate-agents/london/';
 const MAX_CONCURRENCY = 1;
-const AGENTS_PER_PAGE_ESTIMATE = 20;
+const AGENTS_PER_PAGE = 25;
+const MAX_RETRIES = 3;
+const BACKOFF_MS = 2000;
+
+// User-Agent rotation pool
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+];
+
+const getRandomUserAgent = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+const randomDelay = (min = 2000, max = 5000) => min + Math.random() * (max - min);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 const cleanText = (text) => (text ? String(text).replace(/\s+/g, ' ').trim() : null);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const ensureAbsoluteUrl = (value) => {
     if (!value) return null;
@@ -36,8 +53,7 @@ const ensureAbsoluteUrl = (value) => {
     }
     if (typeof url !== 'string') return null;
     const trimmed = url.trim();
-    if (!trimmed) return null;
-    if (trimmed.startsWith('data:') || trimmed.startsWith('mailto:') || trimmed.startsWith('tel:')) return null;
+    if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('mailto:') || trimmed.startsWith('tel:')) return null;
     if (trimmed.startsWith('//')) return `https:${trimmed}`;
     if (trimmed.startsWith('http')) return trimmed;
     return `${BASE_URL}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
@@ -55,20 +71,8 @@ const safeJsonParse = (value) => {
 const parseNumber = (value) => {
     if (typeof value === 'number') return Number.isFinite(value) ? value : null;
     if (!value) return null;
-    const numeric = String(value).replace(/[^\d.]/g, '');
+    const numeric = String(value).replace(/[^\\d.]/g, '');
     return numeric ? Number(numeric) : null;
-};
-
-const buildAddressFromObject = (addressObj) => {
-    if (!addressObj || typeof addressObj !== 'object') return null;
-    const parts = [
-        addressObj.streetAddress,
-        addressObj.addressLocality,
-        addressObj.addressRegion,
-        addressObj.postalCode,
-        addressObj.addressCountry,
-    ].map(cleanText).filter(Boolean);
-    return parts.length ? parts.join(', ') : null;
 };
 
 const extractUkPostcode = (value) => {
@@ -93,43 +97,92 @@ const normalizePhone = (value) => {
     return match ? match[0].replace(/\s+/g, ' ').trim() : null;
 };
 
-const extractAgentIdFromUrl = (url) => {
-    if (!url) return null;
-    const match = url.match(/\/branch\/[^/]*\/(\d+)\b/i);
-    if (match) return match[1];
-    const numericTail = url.match(/\/(\d+)\/?$/);
-    if (numericTail) return numericTail[1];
-    const slugMatch = url.match(/\/branch\/([^/]+)\/?/i);
-    return slugMatch ? slugMatch[1] : null;
-};
-
-const parseCountFromText = (text, pattern) => {
-    if (!text) return null;
-    const match = text.match(pattern);
-    if (!match) return null;
-    const value = match[1]?.replace(/,/g, '');
-    return value ? Number(value) : null;
-};
-
-const getPageParamName = (url) => {
-    if (url.searchParams.has('pn')) return 'pn';
-    if (url.searchParams.has('page')) return 'page';
-    return 'pn';
-};
-
 const buildSearchUrlForPage = (startUrl, page) => {
     const url = new URL(startUrl);
-    const pageParam = getPageParamName(url);
+    url.searchParams.delete('page');
     if (page > 1) {
-        url.searchParams.set(pageParam, String(page));
+        url.searchParams.set('pn', String(page));
     } else {
-        url.searchParams.delete(pageParam);
+        url.searchParams.delete('pn');
     }
     return url.toString();
 };
 
 // ============================================================================
-// API (NEXT DATA) EXTRACTION
+// HTTP-FIRST FETCHING (Priority 1: JSON API)
+// ============================================================================
+const fetchWithGot = async (url, proxyUrl, retries = MAX_RETRIES) => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const response = await gotScraping({
+                url,
+                proxyUrl,
+                http2: true,
+                timeout: { request: 30000 },
+                headers: {
+                    'User-Agent': getRandomUserAgent(),
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-GB,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="131", "Google Chrome";v="131"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'sec-fetch-dest': 'document',
+                    'sec-fetch-mode': 'navigate',
+                    'sec-fetch-site': 'none',
+                    'sec-fetch-user': '?1',
+                    'upgrade-insecure-requests': '1',
+                },
+                responseType: 'text',
+            });
+
+            if (response.statusCode === 200) {
+                return { success: true, body: response.body, statusCode: 200 };
+            }
+            if (response.statusCode === 403 || response.statusCode === 429) {
+                log.warning(`HTTP ${response.statusCode} on attempt ${attempt}/${retries}`);
+                if (attempt < retries) {
+                    await sleep(BACKOFF_MS * Math.pow(2, attempt - 1));
+                }
+            }
+        } catch (error) {
+            log.warning(`Fetch error attempt ${attempt}: ${error.message}`);
+            if (attempt < retries) {
+                await sleep(BACKOFF_MS * Math.pow(2, attempt - 1));
+            }
+        }
+    }
+    return { success: false, body: null, statusCode: 0 };
+};
+
+const fetchJsonApi = async (apiUrl, proxyUrl) => {
+    try {
+        const response = await gotScraping({
+            url: apiUrl,
+            proxyUrl,
+            http2: true,
+            timeout: { request: 20000 },
+            headers: {
+                'User-Agent': getRandomUserAgent(),
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-GB,en;q=0.9',
+                'Referer': BASE_URL,
+            },
+            responseType: 'json',
+        });
+        if (response.statusCode === 200) {
+            return response.body;
+        }
+    } catch (error) {
+        log.debug(`JSON API fetch failed: ${error.message}`);
+    }
+    return null;
+};
+
+// ============================================================================
+// __NEXT_DATA__ EXTRACTION (Direct path access)
 // ============================================================================
 const extractNextDataFromHtml = (html) => {
     const match = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
@@ -137,266 +190,130 @@ const extractNextDataFromHtml = (html) => {
     return safeJsonParse(match[1]?.trim());
 };
 
-const buildNextDataUrl = (pageUrl, buildId) => {
+const buildNextDataApiUrl = (pageUrl, buildId) => {
     if (!buildId) return null;
     const url = new URL(pageUrl);
-    const path = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : url.pathname;
-    const dataPath = `${path}.json`;
-    return `${url.origin}/_next/data/${buildId}${dataPath}${url.search}`;
+    let path = url.pathname;
+    if (path.endsWith('/')) path = path.slice(0, -1);
+    return `${url.origin}/_next/data/${buildId}${path}.json${url.search}`;
 };
 
-const looksLikeAgentRecord = (record) => {
-    if (!record || typeof record !== 'object') return false;
-    const name = record.name || record.branchName || record.branch_name || record.companyName || record.company_name;
-    const url = record.url || record.branchUrl || record.profileUrl || record.branch_url;
-    const address = record.address || record.displayAddress || record.address_line || record.addressLine;
-    const id = record.branchId || record.branch_id || record.agentId || record.id;
-    return Boolean(name && (url || address || id));
+// Extract agents directly from the correct path in __NEXT_DATA__
+const extractAgentsFromNextData = (nextData) => {
+    if (!nextData?.props?.pageProps?.data?.agents?.results) {
+        return { agents: [], totalCount: 0, buildId: nextData?.buildId || null };
+    }
+
+    const agentsData = nextData.props.pageProps.data.agents;
+    const results = agentsData.results || [];
+    const totalCount = agentsData.totalCount || results.length;
+    const buildId = nextData.buildId || null;
+
+    const agents = results.map((agent) => normalizeZooplaAgent(agent, 'api'));
+    return { agents, totalCount, buildId };
 };
 
-const normalizeAgentRecord = (record, source) => {
-    if (!record || typeof record !== 'object') return null;
+// Normalize Zoopla agent record to output format
+const normalizeZooplaAgent = (agent, source) => {
+    if (!agent || typeof agent !== 'object') return null;
 
-    const addressObj = record.address && typeof record.address === 'object' ? record.address : null;
-    const structuredAddress = buildAddressFromObject(addressObj);
-    const address = cleanText(
-        record.displayAddress ||
-        record.address ||
-        record.address_line ||
-        record.addressLine ||
-        structuredAddress
-    );
+    // Extract listing statistics
+    const residential = agent.listingsStatistics?.residential || {};
+    const forSale = residential.forSale || {};
+    const toRent = residential.toRent || {};
 
-    const locality = cleanText(
-        record.locality ||
-        record.town ||
-        record.city ||
-        addressObj?.addressLocality
-    );
-
-    const url = ensureAbsoluteUrl(
-        record.url ||
-        record.branchUrl ||
-        record.profileUrl ||
-        record.branch_url ||
-        record.link
-    );
-
-    const name = cleanText(
-        record.name ||
-        record.branchName ||
-        record.branch_name ||
-        record.companyName ||
-        record.company_name ||
-        record.legalName
-    );
-
-    const branchName = cleanText(record.branchName || record.branch_name || record.branch);
-    const companyName = cleanText(record.companyName || record.company_name || record.company || record.firmName);
-
-    const phone = normalizePhone(
-        record.telephone ||
-        record.phone ||
-        record.phoneNumber ||
-        record.contactTelephone ||
-        record.contact_phone ||
-        record.contact?.telephone ||
-        record.contact?.phone ||
-        record.contact?.phoneNumber
-    );
-
-    const website = ensureAbsoluteUrl(
-        record.website ||
-        record.websiteUrl ||
-        record.website_url ||
-        record.contact?.url
-    );
-
-    const logo = ensureAbsoluteUrl(
-        record.logo ||
-        record.image ||
-        record.branding?.logo ||
-        record.branding?.logoUrl
-    );
-
-    const rating = parseNumber(
-        record.rating ||
-        record.ratingValue ||
-        record.averageRating ||
-        record.aggregateRating?.ratingValue
-    );
-
-    const reviewCount = parseNumber(
-        record.reviewCount ||
-        record.reviewsCount ||
-        record.review_count ||
-        record.aggregateRating?.reviewCount
-    );
-
-    const listingsForSale = parseNumber(
-        record.listingsForSale ||
-        record.listings_for_sale ||
-        record.propertiesForSale ||
-        record.numForSale
-    );
-
-    const listingsToRent = parseNumber(
-        record.listingsToRent ||
-        record.listings_to_rent ||
-        record.propertiesToRent ||
-        record.numToRent
-    );
-
-    const agentId = record.branchId || record.branch_id || record.agentId || record.id || extractAgentIdFromUrl(url);
-    const postalCode = record.postcode || addressObj?.postalCode || extractUkPostcode(address);
+    const agentId = agent.id || agent.branchId || null;
+    const name = cleanText(agent.displayName || agent.name || agent.branchName);
+    const displayAddress = cleanText(agent.displayAddress || agent.address);
 
     return {
         agentId: agentId ? String(agentId) : null,
         name,
-        branchName: branchName || name,
-        companyName,
-        url,
-        address,
-        postalCode: postalCode ? String(postalCode).toUpperCase() : null,
-        locality,
-        phone,
-        website,
-        logo,
-        rating,
-        reviewCount,
-        listingsForSale,
-        listingsToRent,
+        branchName: cleanText(agent.branchName) || name,
+        companyName: cleanText(agent.companyName || agent.company),
+        url: ensureAbsoluteUrl(agent.uriName ? `/find-agents/branch/${agent.uriName}/${agent.id}/` : agent.url),
+        address: displayAddress,
+        postalCode: extractUkPostcode(displayAddress),
+        locality: cleanText(agent.locality || agent.town),
+        phone: normalizePhone(agent.contactNumber || agent.telephone || agent.phone),
+        website: ensureAbsoluteUrl(agent.website),
+        logo: ensureAbsoluteUrl(agent.logo),
+        rating: parseNumber(agent.rating || agent.ratingValue),
+        reviewCount: parseNumber(agent.reviewCount),
+        listingsForSale: parseNumber(forSale.availableListings),
+        listingsToRent: parseNumber(toRent.availableListings),
+        avgAskingPrice: parseNumber(forSale.avgAskingPrice),
+        avgRentPrice: parseNumber(toRent.avgAskingPrice),
+        featured: Boolean(agent.featured),
         source,
     };
 };
 
-const extractAgentsFromApiPayload = (payload, source) => {
-    if (!payload) return [];
-    const results = [];
-    const seen = new WeakSet();
-    const queue = [payload];
-    let steps = 0;
-
-    while (queue.length && steps < 20000) {
-        const current = queue.shift();
-        steps += 1;
-
-        if (!current || typeof current !== 'object') continue;
-        if (seen.has(current)) continue;
-        seen.add(current);
-
-        if (Array.isArray(current)) {
-            for (const entry of current) queue.push(entry);
-            continue;
-        }
-
-        if (looksLikeAgentRecord(current)) {
-            const normalized = normalizeAgentRecord(current, source);
-            if (normalized) results.push(normalized);
-        }
-
-        for (const value of Object.values(current)) {
-            if (value && typeof value === 'object') queue.push(value);
-        }
-    }
-
-    return results;
-};
-
 // ============================================================================
-// JSON-LD EXTRACTION
+// JSON-LD EXTRACTION (Fallback)
 // ============================================================================
 const extractAgentsFromJsonLd = (html) => {
     const $ = cheerioLoad(html);
     const scripts = $('script[type="application/ld+json"]');
     const results = [];
-    const visited = new WeakSet();
-
-    const walk = (node) => {
-        if (!node || typeof node !== 'object') return;
-        if (visited.has(node)) return;
-        visited.add(node);
-
-        if (Array.isArray(node)) {
-            node.forEach(walk);
-            return;
-        }
-
-        const nodeType = node['@type'];
-        const types = Array.isArray(nodeType) ? nodeType : nodeType ? [nodeType] : [];
-        const isAgentType = types.some((type) => [
-            'RealEstateAgent',
-            'RealEstateAgency',
-            'Organization',
-            'LocalBusiness',
-            'ProfessionalService',
-        ].includes(type));
-
-        if (isAgentType) {
-            const normalized = normalizeAgentRecord(node, 'json-ld');
-            if (normalized) results.push(normalized);
-        }
-
-        if (node.itemListElement) walk(node.itemListElement);
-        if (node.item) walk(node.item);
-        if (node.mainEntity) walk(node.mainEntity);
-        if (node.about) walk(node.about);
-
-        for (const value of Object.values(node)) {
-            if (value && typeof value === 'object') walk(value);
-        }
-    };
 
     scripts.each((_, scriptEl) => {
         const jsonText = $(scriptEl).contents().text();
         const parsed = safeJsonParse(jsonText);
-        if (parsed) walk(parsed);
+        if (!parsed) return;
+
+        const walk = (node) => {
+            if (!node || typeof node !== 'object') return;
+            if (Array.isArray(node)) {
+                node.forEach(walk);
+                return;
+            }
+            const nodeType = node['@type'];
+            const types = Array.isArray(nodeType) ? nodeType : nodeType ? [nodeType] : [];
+            if (types.some((t) => ['RealEstateAgent', 'RealEstateAgency', 'Organization', 'LocalBusiness'].includes(t))) {
+                const normalized = normalizeZooplaAgent(node, 'json-ld');
+                if (normalized?.name) results.push(normalized);
+            }
+            for (const value of Object.values(node)) {
+                if (value && typeof value === 'object') walk(value);
+            }
+        };
+        walk(parsed);
     });
 
     return results;
 };
 
 // ============================================================================
-// HTML EXTRACTION
+// HTML EXTRACTION (Final Fallback)
 // ============================================================================
 const extractAgentsFromHtml = (html) => {
     const $ = cheerioLoad(html);
     const results = [];
     const seen = new Set();
 
-    const cardSelectors = [
-        'article[data-testid*="agent"]',
-        'div[data-testid*="agent"]',
-        'li[data-testid*="agent"]',
-        'article[class*="agent"]',
-        'div[class*="agent"]',
-        'li[class*="agent"]',
-    ];
+    // Find agent cards via links to branch pages
+    const branchLinks = $('a[href*="/find-agents/branch/"], a[href*="/estate-agents/branch/"]');
 
-    let cards = $(cardSelectors.join(','));
-    if (!cards.length) {
-        const linkSelectors = [
-            'a[href*="/find-agents/branch/"]',
-            'a[href*="/find-agents/estate-agent/"]',
-            'a[href*="/estate-agents/branch/"]',
-            'a[href*="/estate-agent/branch/"]',
-        ];
-        const found = [];
-        $(linkSelectors.join(',')).each((_, linkEl) => {
-            const card = $(linkEl).closest('article, li, div');
-            if (card.length) found.push(card.get(0));
-        });
-        cards = $(found);
-    }
+    branchLinks.each((_, linkEl) => {
+        const link = $(linkEl);
+        const href = link.attr('href');
+        const url = ensureAbsoluteUrl(href);
+        if (!url || seen.has(url)) return;
+        seen.add(url);
 
-    cards.each((_, cardEl) => {
-        const card = $(cardEl);
-        const linkEl = card.find('a[href*="/find-agents/"], a[href*="/estate-agents/"], a[href*="/estate-agent/"]').first();
-        const url = ensureAbsoluteUrl(linkEl.attr('href'));
+        // Find parent card container
+        const card = link.closest('article, li, div[class*="agent"], div[class*="card"]');
+        const cardText = card.length ? card.text() : '';
+
+        // Extract agent ID from URL
+        const idMatch = href?.match(/\/(\d+)\/?$/);
+        const agentId = idMatch ? idMatch[1] : null;
 
         const name = cleanText(
             card.find('h1, h2, h3, h4').first().text() ||
-            linkEl.text()
+            link.find('[class*="name"]').text() ||
+            link.text()
         );
 
         const address = cleanText(
@@ -405,95 +322,57 @@ const extractAgentsFromHtml = (html) => {
         );
 
         const phone = normalizePhone(
-            card.find('a[href^="tel:"]').first().attr('href') ||
-            card.text()
+            card.find('a[href^="tel:"]').first().attr('href')
         );
-
-        const websiteEl = card.find('a').filter((_, el) => {
-            const href = $(el).attr('href') || '';
-            const text = $(el).text().toLowerCase();
-            return (href.startsWith('http') && !href.includes('zoopla.co.uk')) || text.includes('website');
-        }).first();
-        const website = ensureAbsoluteUrl(websiteEl.attr('href'));
 
         const logo = ensureAbsoluteUrl(
             card.find('img[alt*="logo" i]').first().attr('src') ||
             card.find('img').first().attr('src')
         );
 
-        const cardText = card.text();
+        // Parse listing counts from text
+        const forSaleMatch = cardText.match(/(\d+)\s+propert(?:y|ies)\s+for\s+sale/i);
+        const toRentMatch = cardText.match(/(\d+)\s+propert(?:y|ies)\s+to\s+rent/i);
 
-        const rating = parseNumber(
-            parseCountFromText(cardText, /(\d+(?:\.\d+)?)\s*out of\s*5/i)
-        );
-
-        const reviewCount = parseNumber(
-            parseCountFromText(cardText, /(\d+)\s+reviews?/i)
-        );
-
-        const listingsForSale = parseNumber(
-            parseCountFromText(cardText, /(\d+)\s+properties?\s+for\s+sale/i)
-        );
-
-        const listingsToRent = parseNumber(
-            parseCountFromText(cardText, /(\d+)\s+properties?\s+to\s+rent/i)
-        );
-
-        const agentId = extractAgentIdFromUrl(url);
-
-        const normalized = {
-            agentId: agentId ? String(agentId) : null,
-            name,
-            branchName: name,
-            companyName: null,
-            url,
-            address,
-            postalCode: extractUkPostcode(address),
-            locality: null,
-            phone,
-            website,
-            logo,
-            rating,
-            reviewCount,
-            listingsForSale,
-            listingsToRent,
-            source: 'html',
-        };
-
-        const key = normalized.agentId || normalized.url || `${normalized.name}|${normalized.address}`;
-        if (!key || seen.has(key)) return;
-        seen.add(key);
-
-        results.push(normalized);
+        if (name) {
+            results.push({
+                agentId,
+                name,
+                branchName: name,
+                companyName: null,
+                url,
+                address,
+                postalCode: extractUkPostcode(address),
+                locality: null,
+                phone,
+                website: null,
+                logo,
+                rating: null,
+                reviewCount: null,
+                listingsForSale: forSaleMatch ? Number(forSaleMatch[1]) : null,
+                listingsToRent: toRentMatch ? Number(toRentMatch[1]) : null,
+                avgAskingPrice: null,
+                avgRentPrice: null,
+                featured: false,
+                source: 'html',
+            });
+        }
     });
 
     return results;
 };
 
-const findNextPageUrl = (html, currentUrl) => {
-    const $ = cheerioLoad(html);
-    const relNext = $('link[rel="next"]').attr('href') || $('a[rel="next"]').attr('href');
-    if (relNext) return ensureAbsoluteUrl(relNext);
-
-    const nextLink = $('a[aria-label*="Next"], a[data-testid*="pagination-next"], a[class*="next"]').first();
-    if (nextLink.length) return ensureAbsoluteUrl(nextLink.attr('href'));
-
-    const url = new URL(currentUrl);
-    const pageParam = getPageParamName(url);
-    const currentPage = parseNumber(url.searchParams.get(pageParam)) || 1;
-    return buildSearchUrlForPage(currentUrl, currentPage + 1);
-};
-
+// ============================================================================
+// DEDUPLICATION
+// ============================================================================
 const dedupeAgents = (agents) => {
     const seen = new Set();
-    const results = [];
-    for (const agent of agents) {
+    return agents.filter((agent) => {
         const key = agent.agentId || agent.url || `${agent.name}|${agent.address}`;
-        if (!key || seen.has(key)) continue;
+        if (!key || seen.has(key)) return false;
         seen.add(key);
-        results.push(agent);
-    }
-    return results;
+        return true;
+    });
 };
 
 // ============================================================================
@@ -504,17 +383,18 @@ await Actor.init();
 try {
     const input = (await Actor.getInput()) || {};
 
+    // Parse inputs
     const startUrls = Array.isArray(input.startUrls) && input.startUrls.length ? input.startUrls : null;
     const startUrl = input.startUrl || (startUrls ? null : DEFAULT_START_URL);
 
     if (!startUrl && !startUrls) {
-        log.error('Missing startUrl');
+        log.error('Missing startUrl or startUrls');
         await Actor.exit({ exitCode: 1 });
     }
 
     const resultsWanted = Math.max(1, Number.isFinite(+input.results_wanted) ? +input.results_wanted : 50);
     const maxPagesInput = Number.isFinite(+input.max_pages) ? Math.max(1, +input.max_pages) : null;
-    const estimatedPages = Math.ceil(resultsWanted / AGENTS_PER_PAGE_ESTIMATE);
+    const estimatedPages = Math.ceil(resultsWanted / AGENTS_PER_PAGE);
     const maxPages = maxPagesInput ?? Math.max(1, estimatedPages);
 
     const proxyConfiguration = await Actor.createProxyConfiguration({
@@ -524,131 +404,146 @@ try {
         ...input.proxyConfiguration,
     });
 
-    log.info('Zoopla Agent Scraper v1.0.0', { resultsWanted, maxPages });
+    log.info('🏠 Zoopla Agent Scraper v2.0.0', { resultsWanted, maxPages });
 
     const seen = new Set();
-    const queued = new Set();
     let saved = 0;
+    let buildId = null;
 
-    const requestQueue = await Actor.openRequestQueue();
+    // Process each start URL
     const targets = startUrls || [startUrl];
 
-    for (const target of targets) {
-        const url = buildSearchUrlForPage(target, 1);
-        queued.add(url);
-        await requestQueue.addRequest({
-            url,
-            userData: { page: 1, rootUrl: target },
-        });
-    }
+    for (const targetUrl of targets) {
+        if (saved >= resultsWanted) break;
 
-    const camoufoxOptions = await camoufoxLaunchOptions({ headless: true, geoip: true });
+        log.info(`📍 Starting: ${targetUrl}`);
 
-    const crawler = new PlaywrightCrawler({
-        requestQueue,
-        proxyConfiguration,
-        maxConcurrency: MAX_CONCURRENCY,
-        maxRequestRetries: 3,
-        retryOnBlocked: true,
-        useSessionPool: true,
-        persistCookiesPerSession: true,
-        sessionPoolOptions: {
-            maxUsageCount: 5,
-            blockedStatusCodes: [403, 429],
-        },
-        requestHandlerTimeoutSecs: 120,
-        navigationTimeoutSecs: 90,
+        // Get proxy URL for got-scraping
+        const proxyInfo = await proxyConfiguration.newUrl();
 
-        launchContext: {
-            launcher: firefox,
-            launchOptions: camoufoxOptions,
-        },
+        // Phase 1: Try HTTP-first approach with got-scraping
+        for (let page = 1; page <= maxPages && saved < resultsWanted; page++) {
+            await sleep(randomDelay(2000, 4000));
 
-        browserPoolOptions: {
-            useFingerprints: false,
-            maxOpenPagesPerBrowser: 1,
-            retireBrowserAfterPageCount: 2,
-        },
-
-        preNavigationHooks: [
-            async () => {
-                await sleep(2000 + Math.random() * 2000);
-            },
-        ],
-
-        postNavigationHooks: [
-            async ({ page }) => {
-                await page.waitForLoadState('domcontentloaded');
-                await sleep(1500);
-
-                await page.waitForSelector('body', { timeout: 15000 }).catch(() => { });
-
-                for (let i = 0; i < 4; i++) {
-                    await page.evaluate(() => window.scrollBy(0, 500));
-                    await sleep(300);
-                }
-                await sleep(500);
-            },
-        ],
-
-        async requestHandler({ request, page }) {
-            const pageNum = request.userData.page || 1;
-
-            if (saved >= resultsWanted) {
-                log.debug(`Skip page ${pageNum}`);
-                return;
-            }
-
-            const htmlResponse = await page.context().request.get(request.url, { timeout: 30000 }).catch(() => null);
-            const html = htmlResponse && htmlResponse.ok() ? await htmlResponse.text() : await page.content();
-
-            if (html.includes('Just a moment') || html.includes('Verify you are human')) {
-                log.warning(`Cloudflare on page ${pageNum}, waiting...`);
-                await sleep(8000);
-                await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => { });
-            }
-
-            log.info(`Page ${pageNum}/${maxPages}`);
-
-            const nextData = extractNextDataFromHtml(html);
-            const buildId = nextData?.buildId;
+            const pageUrl = buildSearchUrlForPage(targetUrl, page);
+            log.info(`📄 Page ${page}/${maxPages}`);
 
             let agents = [];
+            let usedPlaywright = false;
 
-            if (buildId) {
-                const apiUrl = buildNextDataUrl(request.url, buildId);
+            // Try JSON API if we have buildId from previous page
+            if (buildId && page > 1) {
+                const apiUrl = buildNextDataApiUrl(pageUrl, buildId);
                 if (apiUrl) {
-                    const apiResponse = await page.context().request.get(apiUrl, { timeout: 30000 }).catch(() => null);
-                    if (apiResponse && apiResponse.ok()) {
-                        const apiPayload = await apiResponse.json().catch(() => null);
-                        if (apiPayload) {
-                            agents = extractAgentsFromApiPayload(apiPayload, 'api');
-                        }
+                    log.debug(`Trying JSON API: ${apiUrl}`);
+                    const apiData = await fetchJsonApi(apiUrl, proxyInfo);
+                    if (apiData?.pageProps?.data?.agents?.results) {
+                        const extracted = extractAgentsFromNextData({ props: apiData, buildId });
+                        agents = extracted.agents;
+                        log.info(`✅ JSON API: ${agents.length} agents`);
                     }
                 }
             }
 
-            if (!agents.length && nextData) {
-                agents = extractAgentsFromApiPayload(nextData, 'api');
-            }
-
+            // Fallback: HTTP fetch HTML and extract __NEXT_DATA__
             if (!agents.length) {
-                agents = extractAgentsFromJsonLd(html);
+                const httpResult = await fetchWithGot(pageUrl, proxyInfo);
+
+                if (httpResult.success) {
+                    const html = httpResult.body;
+
+                    // Check for Cloudflare block
+                    if (html.includes('Just a moment') || html.includes('Verify you are human')) {
+                        log.warning('⚠️ Cloudflare detected, falling back to Playwright');
+                        usedPlaywright = true;
+                    } else {
+                        // Extract from __NEXT_DATA__ (Priority 1)
+                        const nextData = extractNextDataFromHtml(html);
+                        if (nextData) {
+                            const extracted = extractAgentsFromNextData(nextData);
+                            agents = extracted.agents;
+                            buildId = extracted.buildId || buildId;
+                            if (agents.length) {
+                                log.info(`✅ __NEXT_DATA__: ${agents.length} agents (buildId: ${buildId})`);
+                            }
+                        }
+
+                        // Fallback: JSON-LD (Priority 2)
+                        if (!agents.length) {
+                            agents = extractAgentsFromJsonLd(html);
+                            if (agents.length) {
+                                log.info(`✅ JSON-LD: ${agents.length} agents`);
+                            }
+                        }
+
+                        // Fallback: HTML parsing (Priority 3)
+                        if (!agents.length) {
+                            agents = extractAgentsFromHtml(html);
+                            if (agents.length) {
+                                log.info(`✅ HTML: ${agents.length} agents`);
+                            }
+                        }
+                    }
+                } else {
+                    log.warning('⚠️ HTTP fetch failed, falling back to Playwright');
+                    usedPlaywright = true;
+                }
             }
 
-            if (!agents.length) {
-                agents = extractAgentsFromHtml(html);
+            // Final fallback: Playwright with Camoufox
+            if (usedPlaywright || !agents.length) {
+                log.info('🎭 Using Playwright/Camoufox fallback');
+
+                const camoufoxOptions = await camoufoxLaunchOptions({ headless: true, geoip: true });
+                const browser = await firefox.launch(camoufoxOptions);
+
+                try {
+                    const context = await browser.newContext({
+                        proxy: proxyInfo ? { server: proxyInfo } : undefined,
+                    });
+                    const playwrightPage = await context.newPage();
+
+                    await playwrightPage.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                    await sleep(3000);
+
+                    // Handle Cloudflare
+                    const content = await playwrightPage.content();
+                    if (content.includes('Just a moment') || content.includes('Verify you are human')) {
+                        log.info('⏳ Waiting for Cloudflare...');
+                        await sleep(10000);
+                        await playwrightPage.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => { });
+                    }
+
+                    // Scroll to load content
+                    for (let i = 0; i < 3; i++) {
+                        await playwrightPage.evaluate(() => window.scrollBy(0, 500));
+                        await sleep(500);
+                    }
+
+                    const html = await playwrightPage.content();
+
+                    // Extract with fallback chain
+                    const nextData = extractNextDataFromHtml(html);
+                    if (nextData) {
+                        const extracted = extractAgentsFromNextData(nextData);
+                        agents = extracted.agents;
+                        buildId = extracted.buildId || buildId;
+                    }
+                    if (!agents.length) agents = extractAgentsFromJsonLd(html);
+                    if (!agents.length) agents = extractAgentsFromHtml(html);
+
+                    log.info(`🎭 Playwright: ${agents.length} agents`);
+                } finally {
+                    await browser.close();
+                }
             }
 
+            // Dedupe and save
             agents = dedupeAgents(agents);
-            log.info(`Found ${agents.length} agents`);
-
-            if (!agents.length) return;
 
             const toSave = [];
             for (const agent of agents) {
                 if (saved >= resultsWanted) break;
-
                 const key = agent.agentId || agent.url || `${agent.name}|${agent.address}`;
                 if (!key || seen.has(key)) continue;
                 seen.add(key);
@@ -662,36 +557,22 @@ try {
 
             if (toSave.length) {
                 await Dataset.pushData(toSave);
-                log.info(`Saved ${saved}/${resultsWanted}`);
+                log.info(`💾 Saved ${saved}/${resultsWanted} agents`);
             }
 
-            if (pageNum < maxPages && saved < resultsWanted) {
-                const nextUrl = findNextPageUrl(html, request.url);
-                if (nextUrl && !queued.has(nextUrl)) {
-                    queued.add(nextUrl);
-                    await requestQueue.addRequest({
-                        url: nextUrl,
-                        userData: {
-                            page: pageNum + 1,
-                            rootUrl: request.userData.rootUrl,
-                        },
-                    });
-                }
+            // Stop if no agents found (likely last page)
+            if (!agents.length) {
+                log.info('📭 No more agents found, stopping pagination');
+                break;
             }
-        },
+        }
+    }
 
-        async failedRequestHandler({ request, error }) {
-            log.error(`Failed: ${request.url} - ${error.message}`);
-        },
-    });
-
-    await crawler.run();
-
-    log.info(`Done! ${saved} agents`);
+    log.info(`✨ Done! Scraped ${saved} agents`);
     await Actor.setStatusMessage(`Scraped ${saved} agents`);
 
 } catch (error) {
-    log.error(error.message);
+    log.error(`Error: ${error.message}`);
     throw error;
 } finally {
     await Actor.exit();
