@@ -1,0 +1,88 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "agentId",
+          "name",
+          "branchName",
+          "companyName",
+          "address",
+          "postalCode",
+          "locality",
+          "phone",
+          "website",
+          "rating",
+          "reviewCount",
+          "listingsForSale",
+          "listingsToRent",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "agentId": {
+            "label": "Agent ID",
+            "format": "text"
+          },
+          "name": {
+            "label": "Name",
+            "format": "text"
+          },
+          "branchName": {
+            "label": "Branch",
+            "format": "text"
+          },
+          "companyName": {
+            "label": "Company",
+            "format": "text"
+          },
+          "address": {
+            "label": "Address",
+            "format": "text"
+          },
+          "postalCode": {
+            "label": "Postcode",
+            "format": "text"
+          },
+          "locality": {
+            "label": "Locality",
+            "format": "text"
+          },
+          "phone": {
+            "label": "Phone",
+            "format": "text"
+          },
+          "website": {
+            "label": "Website",
+            "format": "link"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "text"
+          },
+          "reviewCount": {
+            "label": "Reviews",
+            "format": "text"
+          },
+          "listingsForSale": {
+            "label": "For sale",
+            "format": "text"
+          },
+          "listingsToRent": {
+            "label": "To rent",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}

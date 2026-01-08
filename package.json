@@ -1,0 +1,32 @@
+{
+  "name": "zoopla-agent-scraper",
+  "version": "1.0.0",
+  "description": "Zoopla estate agent directory scraper with API-first extraction and HTML fallback",
+  "type": "module",
+  "dependencies": {
+    "apify": "^3.5.3",
+    "@crawlee/playwright": "^3.15.3",
+    "cheerio": "^1.0.0-rc.12",
+    "camoufox-js": "^0.7.0",
+    "playwright": "1.56.1"
+  },
+  "devDependencies": {
+    "@apify/eslint-config": "^1.0.0",
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.5",
+    "prettier": "^3.5.3"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "test": "echo \"Error: oops, the Actor has no tests yet, sad!\" && exit 1"
+  },
+  "author": "Shahid",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

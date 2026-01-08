@@ -1,0 +1,12 @@
+{
+  "startUrl": "https://www.zoopla.co.uk/find-agents/estate-agents/london/",
+  "results_wanted": 50,
+  "max_pages": 5,
+  "proxyConfiguration": {
+    "useApifyProxy": true,
+    "apifyProxyGroups": [
+      "RESIDENTIAL"
+    ],
+    "countryCode": "GB"
+  }
+}

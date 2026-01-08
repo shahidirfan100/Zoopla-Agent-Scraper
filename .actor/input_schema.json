@@ -1,0 +1,57 @@
+{
+  "title": "Zoopla Agent Scraper",
+  "description": "Scrape Zoopla estate agent directory pages and collect agent details such as name, address, phone, listings counts, and ratings.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrls": {
+      "title": "Multiple search URLs",
+      "type": "array",
+      "description": "Optional list of multiple Zoopla agent directory URLs to crawl.",
+      "editor": "stringList"
+    },
+    "results_wanted": {
+      "title": "Maximum agents",
+      "type": "integer",
+      "description": "Maximum number of agents to collect. Pages are estimated and capped by max pages.",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 50,
+      "prefill": 50,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum pages",
+      "type": "integer",
+      "description": "Maximum number of directory pages to crawl per search URL.",
+      "minimum": 1,
+      "maximum": 200,
+      "default": 5,
+      "prefill": 5,
+      "editor": "number"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "REQUIRED: Use Apify RESIDENTIAL proxies with UK country code for best results.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ],
+        "countryCode": "GB"
+      },
+      "prefill": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ],
+        "countryCode": "GB"
+      }
+    }
+  },
+  "required": [
+    "proxyConfiguration"
+  ]
+}
