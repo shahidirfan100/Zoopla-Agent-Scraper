@@ -1,18 +1,16 @@
 /**
- * Zoopla Agent Scraper - Production Ready v2.0.0
+ * Zoopla Agent Scraper - Production Ready v2.1.0
  *
  * Features:
- * - HTTP-first with got-scraping (Priority 1: JSON API)
+ * - Playwright/Camoufox ONLY (no HTTP requests)
  * - __NEXT_DATA__ extraction from correct path
- * - /_next/data/{buildId}/ JSON API for pagination
- * - Playwright/Camoufox fallback for Cloudflare bypass
- * - JSON-LD + HTML fallbacks (Priority 2)
- * - Full stealth: User-Agent rotation, delays, session persistence
+ * - JSON-LD + HTML fallbacks
+ * - Full stealth: Camoufox fingerprinting, session persistence
+ * - Proper proxy integration with PlaywrightCrawler
  */
 
 import { PlaywrightCrawler } from '@crawlee/playwright';
 import { Actor, Dataset, log } from 'apify';
-import { gotScraping } from 'got-scraping';
 import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
 import { firefox } from 'playwright';
 import { load as cheerioLoad } from 'cheerio';
@@ -24,21 +22,9 @@ const BASE_URL = 'https://www.zoopla.co.uk';
 const DEFAULT_START_URL = 'https://www.zoopla.co.uk/find-agents/estate-agents/london/';
 const MAX_CONCURRENCY = 1;
 const AGENTS_PER_PAGE = 25;
-const MAX_RETRIES = 3;
-const BACKOFF_MS = 2000;
 
-// User-Agent rotation pool
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-];
-
-const getRandomUserAgent = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-const randomDelay = (min = 2000, max = 5000) => min + Math.random() * (max - min);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const randomDelay = (min = 2000, max = 5000) => min + Math.random() * (max - min);
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -71,7 +57,7 @@ const safeJsonParse = (value) => {
 const parseNumber = (value) => {
     if (typeof value === 'number') return Number.isFinite(value) ? value : null;
     if (!value) return null;
-    const numeric = String(value).replace(/[^\\d.]/g, '');
+    const numeric = String(value).replace(/[^\d.]/g, '');
     return numeric ? Number(numeric) : null;
 };
 
@@ -109,93 +95,12 @@ const buildSearchUrlForPage = (startUrl, page) => {
 };
 
 // ============================================================================
-// HTTP-FIRST FETCHING (Priority 1: JSON API)
-// ============================================================================
-const fetchWithGot = async (url, proxyUrl, retries = MAX_RETRIES) => {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            const response = await gotScraping({
-                url,
-                proxyUrl,
-                http2: true,
-                timeout: { request: 30000 },
-                headers: {
-                    'User-Agent': getRandomUserAgent(),
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-GB,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache',
-                    'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="131", "Google Chrome";v="131"',
-                    'sec-ch-ua-mobile': '?0',
-                    'sec-ch-ua-platform': '"Windows"',
-                    'sec-fetch-dest': 'document',
-                    'sec-fetch-mode': 'navigate',
-                    'sec-fetch-site': 'none',
-                    'sec-fetch-user': '?1',
-                    'upgrade-insecure-requests': '1',
-                },
-                responseType: 'text',
-            });
-
-            if (response.statusCode === 200) {
-                return { success: true, body: response.body, statusCode: 200 };
-            }
-            if (response.statusCode === 403 || response.statusCode === 429) {
-                log.warning(`HTTP ${response.statusCode} on attempt ${attempt}/${retries}`);
-                if (attempt < retries) {
-                    await sleep(BACKOFF_MS * Math.pow(2, attempt - 1));
-                }
-            }
-        } catch (error) {
-            log.warning(`Fetch error attempt ${attempt}: ${error.message}`);
-            if (attempt < retries) {
-                await sleep(BACKOFF_MS * Math.pow(2, attempt - 1));
-            }
-        }
-    }
-    return { success: false, body: null, statusCode: 0 };
-};
-
-const fetchJsonApi = async (apiUrl, proxyUrl) => {
-    try {
-        const response = await gotScraping({
-            url: apiUrl,
-            proxyUrl,
-            http2: true,
-            timeout: { request: 20000 },
-            headers: {
-                'User-Agent': getRandomUserAgent(),
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-GB,en;q=0.9',
-                'Referer': BASE_URL,
-            },
-            responseType: 'json',
-        });
-        if (response.statusCode === 200) {
-            return response.body;
-        }
-    } catch (error) {
-        log.debug(`JSON API fetch failed: ${error.message}`);
-    }
-    return null;
-};
-
-// ============================================================================
 // __NEXT_DATA__ EXTRACTION (Direct path access)
 // ============================================================================
 const extractNextDataFromHtml = (html) => {
     const match = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
     if (!match) return null;
     return safeJsonParse(match[1]?.trim());
-};
-
-const buildNextDataApiUrl = (pageUrl, buildId) => {
-    if (!buildId) return null;
-    const url = new URL(pageUrl);
-    let path = url.pathname;
-    if (path.endsWith('/')) path = path.slice(0, -1);
-    return `${url.origin}/_next/data/${buildId}${path}.json${url.search}`;
 };
 
 // Extract agents directly from the correct path in __NEXT_DATA__
@@ -209,7 +114,7 @@ const extractAgentsFromNextData = (nextData) => {
     const totalCount = agentsData.totalCount || results.length;
     const buildId = nextData.buildId || null;
 
-    const agents = results.map((agent) => normalizeZooplaAgent(agent, 'api'));
+    const agents = results.map((agent) => normalizeZooplaAgent(agent, 'api')).filter(Boolean);
     return { agents, totalCount, buildId };
 };
 
@@ -225,6 +130,8 @@ const normalizeZooplaAgent = (agent, source) => {
     const agentId = agent.id || agent.branchId || null;
     const name = cleanText(agent.displayName || agent.name || agent.branchName);
     const displayAddress = cleanText(agent.displayAddress || agent.address);
+
+    if (!name) return null;
 
     return {
         agentId: agentId ? String(agentId) : null,
@@ -397,6 +304,7 @@ try {
     const estimatedPages = Math.ceil(resultsWanted / AGENTS_PER_PAGE);
     const maxPages = maxPagesInput ?? Math.max(1, estimatedPages);
 
+    // Proxy configuration - use Apify proxy properly
     const proxyConfiguration = await Actor.createProxyConfiguration({
         useApifyProxy: true,
         apifyProxyGroups: ['RESIDENTIAL'],
@@ -404,143 +312,150 @@ try {
         ...input.proxyConfiguration,
     });
 
-    log.info('🏠 Zoopla Agent Scraper v2.0.0', { resultsWanted, maxPages });
+    log.info('🏠 Zoopla Agent Scraper v2.1.0 (Playwright Only)', { resultsWanted, maxPages });
 
     const seen = new Set();
+    const queued = new Set();
     let saved = 0;
-    let buildId = null;
 
-    // Process each start URL
+    // Build request queue
+    const requestQueue = await Actor.openRequestQueue();
     const targets = startUrls || [startUrl];
 
-    for (const targetUrl of targets) {
-        if (saved >= resultsWanted) break;
+    for (const target of targets) {
+        const url = buildSearchUrlForPage(target, 1);
+        queued.add(url);
+        await requestQueue.addRequest({
+            url,
+            userData: { page: 1, rootUrl: target },
+        });
+    }
 
-        log.info(`📍 Starting: ${targetUrl}`);
+    // Camoufox stealth options
+    const camoufoxOptions = await camoufoxLaunchOptions({ headless: true, geoip: true });
 
-        // Get proxy URL for got-scraping
-        const proxyInfo = await proxyConfiguration.newUrl();
+    const crawler = new PlaywrightCrawler({
+        requestQueue,
+        proxyConfiguration,
+        maxConcurrency: MAX_CONCURRENCY,
+        maxRequestRetries: 5,
+        retryOnBlocked: true,
+        useSessionPool: true,
+        persistCookiesPerSession: true,
+        sessionPoolOptions: {
+            maxPoolSize: 10,
+            sessionOptions: {
+                maxUsageCount: 3,
+            },
+            blockedStatusCodes: [403, 429, 503],
+        },
+        requestHandlerTimeoutSecs: 180,
+        navigationTimeoutSecs: 120,
 
-        // Phase 1: Try HTTP-first approach with got-scraping
-        for (let page = 1; page <= maxPages && saved < resultsWanted; page++) {
-            await sleep(randomDelay(2000, 4000));
+        // Use Firefox with Camoufox stealth
+        launchContext: {
+            launcher: firefox,
+            launchOptions: {
+                ...camoufoxOptions,
+                args: [...(camoufoxOptions.args || [])],
+            },
+        },
 
-            const pageUrl = buildSearchUrlForPage(targetUrl, page);
-            log.info(`📄 Page ${page}/${maxPages}`);
+        browserPoolOptions: {
+            useFingerprints: false,
+            maxOpenPagesPerBrowser: 1,
+            retireBrowserAfterPageCount: 3,
+        },
+
+        // Pre-navigation: random delay for stealth
+        preNavigationHooks: [
+            async () => {
+                const delay = randomDelay(3000, 6000);
+                log.debug(`Pre-nav delay: ${Math.round(delay)}ms`);
+                await sleep(delay);
+            },
+        ],
+
+        // Post-navigation: wait for content and scroll
+        postNavigationHooks: [
+            async ({ page }) => {
+                await page.waitForLoadState('domcontentloaded');
+                await sleep(2000);
+
+                // Check for Cloudflare
+                const content = await page.content();
+                if (content.includes('Just a moment') || content.includes('Verify you are human')) {
+                    log.info('⏳ Cloudflare detected, waiting...');
+                    await sleep(10000);
+                    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => { });
+                    await sleep(3000);
+                }
+
+                // Scroll to simulate human behavior
+                for (let i = 0; i < 4; i++) {
+                    await page.evaluate(() => window.scrollBy(0, 400));
+                    await sleep(300 + Math.random() * 300);
+                }
+                await sleep(1000);
+            },
+        ],
+
+        async requestHandler({ request, page }) {
+            const pageNum = request.userData.page || 1;
+
+            if (saved >= resultsWanted) {
+                log.debug(`Skip page ${pageNum} - target reached`);
+                return;
+            }
+
+            log.info(`📄 Page ${pageNum}/${maxPages}`);
+
+            // Get page content
+            const html = await page.content();
+
+            // Check if still on Cloudflare
+            if (html.includes('Just a moment') || html.includes('Verify you are human')) {
+                log.warning('⚠️ Still on Cloudflare, retrying...');
+                throw new Error('Cloudflare challenge not passed');
+            }
 
             let agents = [];
-            let usedPlaywright = false;
 
-            // Try JSON API if we have buildId from previous page
-            if (buildId && page > 1) {
-                const apiUrl = buildNextDataApiUrl(pageUrl, buildId);
-                if (apiUrl) {
-                    log.debug(`Trying JSON API: ${apiUrl}`);
-                    const apiData = await fetchJsonApi(apiUrl, proxyInfo);
-                    if (apiData?.pageProps?.data?.agents?.results) {
-                        const extracted = extractAgentsFromNextData({ props: apiData, buildId });
-                        agents = extracted.agents;
-                        log.info(`✅ JSON API: ${agents.length} agents`);
-                    }
+            // Priority 1: Extract from __NEXT_DATA__
+            const nextData = extractNextDataFromHtml(html);
+            if (nextData) {
+                const extracted = extractAgentsFromNextData(nextData);
+                agents = extracted.agents;
+                if (agents.length) {
+                    log.info(`✅ __NEXT_DATA__: ${agents.length} agents`);
                 }
             }
 
-            // Fallback: HTTP fetch HTML and extract __NEXT_DATA__
+            // Priority 2: JSON-LD fallback
             if (!agents.length) {
-                const httpResult = await fetchWithGot(pageUrl, proxyInfo);
-
-                if (httpResult.success) {
-                    const html = httpResult.body;
-
-                    // Check for Cloudflare block
-                    if (html.includes('Just a moment') || html.includes('Verify you are human')) {
-                        log.warning('⚠️ Cloudflare detected, falling back to Playwright');
-                        usedPlaywright = true;
-                    } else {
-                        // Extract from __NEXT_DATA__ (Priority 1)
-                        const nextData = extractNextDataFromHtml(html);
-                        if (nextData) {
-                            const extracted = extractAgentsFromNextData(nextData);
-                            agents = extracted.agents;
-                            buildId = extracted.buildId || buildId;
-                            if (agents.length) {
-                                log.info(`✅ __NEXT_DATA__: ${agents.length} agents (buildId: ${buildId})`);
-                            }
-                        }
-
-                        // Fallback: JSON-LD (Priority 2)
-                        if (!agents.length) {
-                            agents = extractAgentsFromJsonLd(html);
-                            if (agents.length) {
-                                log.info(`✅ JSON-LD: ${agents.length} agents`);
-                            }
-                        }
-
-                        // Fallback: HTML parsing (Priority 3)
-                        if (!agents.length) {
-                            agents = extractAgentsFromHtml(html);
-                            if (agents.length) {
-                                log.info(`✅ HTML: ${agents.length} agents`);
-                            }
-                        }
-                    }
-                } else {
-                    log.warning('⚠️ HTTP fetch failed, falling back to Playwright');
-                    usedPlaywright = true;
+                agents = extractAgentsFromJsonLd(html);
+                if (agents.length) {
+                    log.info(`✅ JSON-LD: ${agents.length} agents`);
                 }
             }
 
-            // Final fallback: Playwright with Camoufox
-            if (usedPlaywright || !agents.length) {
-                log.info('🎭 Using Playwright/Camoufox fallback');
-
-                const camoufoxOptions = await camoufoxLaunchOptions({ headless: true, geoip: true });
-                const browser = await firefox.launch(camoufoxOptions);
-
-                try {
-                    const context = await browser.newContext({
-                        proxy: proxyInfo ? { server: proxyInfo } : undefined,
-                    });
-                    const playwrightPage = await context.newPage();
-
-                    await playwrightPage.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                    await sleep(3000);
-
-                    // Handle Cloudflare
-                    const content = await playwrightPage.content();
-                    if (content.includes('Just a moment') || content.includes('Verify you are human')) {
-                        log.info('⏳ Waiting for Cloudflare...');
-                        await sleep(10000);
-                        await playwrightPage.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => { });
-                    }
-
-                    // Scroll to load content
-                    for (let i = 0; i < 3; i++) {
-                        await playwrightPage.evaluate(() => window.scrollBy(0, 500));
-                        await sleep(500);
-                    }
-
-                    const html = await playwrightPage.content();
-
-                    // Extract with fallback chain
-                    const nextData = extractNextDataFromHtml(html);
-                    if (nextData) {
-                        const extracted = extractAgentsFromNextData(nextData);
-                        agents = extracted.agents;
-                        buildId = extracted.buildId || buildId;
-                    }
-                    if (!agents.length) agents = extractAgentsFromJsonLd(html);
-                    if (!agents.length) agents = extractAgentsFromHtml(html);
-
-                    log.info(`🎭 Playwright: ${agents.length} agents`);
-                } finally {
-                    await browser.close();
+            // Priority 3: HTML parsing fallback
+            if (!agents.length) {
+                agents = extractAgentsFromHtml(html);
+                if (agents.length) {
+                    log.info(`✅ HTML: ${agents.length} agents`);
                 }
             }
 
-            // Dedupe and save
+            if (!agents.length) {
+                log.warning('⚠️ No agents found on this page');
+                return;
+            }
+
+            // Dedupe
             agents = dedupeAgents(agents);
 
+            // Save agents
             const toSave = [];
             for (const agent of agents) {
                 if (saved >= resultsWanted) break;
@@ -560,19 +475,35 @@ try {
                 log.info(`💾 Saved ${saved}/${resultsWanted} agents`);
             }
 
-            // Stop if no agents found (likely last page)
-            if (!agents.length) {
-                log.info('📭 No more agents found, stopping pagination');
-                break;
+            // Enqueue next page
+            if (pageNum < maxPages && saved < resultsWanted) {
+                const nextUrl = buildSearchUrlForPage(request.userData.rootUrl, pageNum + 1);
+                if (!queued.has(nextUrl)) {
+                    queued.add(nextUrl);
+                    await requestQueue.addRequest({
+                        url: nextUrl,
+                        userData: {
+                            page: pageNum + 1,
+                            rootUrl: request.userData.rootUrl,
+                        },
+                    });
+                    log.debug(`📥 Enqueued page ${pageNum + 1}`);
+                }
             }
-        }
-    }
+        },
+
+        async failedRequestHandler({ request, error }) {
+            log.error(`❌ Failed: ${request.url} - ${error.message}`);
+        },
+    });
+
+    await crawler.run();
 
     log.info(`✨ Done! Scraped ${saved} agents`);
     await Actor.setStatusMessage(`Scraped ${saved} agents`);
 
 } catch (error) {
-    log.error(`Error: ${error.message}`);
+    log.error(`Fatal error: ${error.message}`);
     throw error;
 } finally {
     await Actor.exit();
