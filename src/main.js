@@ -28,12 +28,19 @@ const AGENTS_PER_PAGE_ESTIMATE = 20;
 const cleanText = (text) => (text ? String(text).replace(/\s+/g, ' ').trim() : null);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const ensureAbsoluteUrl = (url) => {
-    if (!url) return null;
-    if (url.startsWith('data:') || url.startsWith('mailto:') || url.startsWith('tel:')) return null;
-    if (url.startsWith('//')) return `https:${url}`;
-    if (url.startsWith('http')) return url;
-    return `${BASE_URL}${url.startsWith('/') ? '' : '/'}${url}`;
+const ensureAbsoluteUrl = (value) => {
+    if (!value) return null;
+    let url = value;
+    if (typeof url === 'object') {
+        url = url.href || url.url || url.value || (typeof url.toString === 'function' ? url.toString() : null);
+    }
+    if (typeof url !== 'string') return null;
+    const trimmed = url.trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith('data:') || trimmed.startsWith('mailto:') || trimmed.startsWith('tel:')) return null;
+    if (trimmed.startsWith('//')) return `https:${trimmed}`;
+    if (trimmed.startsWith('http')) return trimmed;
+    return `${BASE_URL}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
 };
 
 const safeJsonParse = (value) => {
@@ -542,6 +549,13 @@ try {
         proxyConfiguration,
         maxConcurrency: MAX_CONCURRENCY,
         maxRequestRetries: 3,
+        retryOnBlocked: true,
+        useSessionPool: true,
+        persistCookiesPerSession: true,
+        sessionPoolOptions: {
+            maxUsageCount: 5,
+            blockedStatusCodes: [403, 429],
+        },
         requestHandlerTimeoutSecs: 120,
         navigationTimeoutSecs: 90,
 
