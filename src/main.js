@@ -128,25 +128,97 @@ const normalizeZooplaAgent = (agent, source) => {
     const toRent = residential.toRent || {};
 
     const agentId = agent.id || agent.branchId || null;
-    const name = cleanText(agent.displayName || agent.name || agent.branchName);
+
+    // Extract names properly
+    // displayName is typically "Company Name - Branch Name" or just company name
+    const displayName = cleanText(agent.displayName || agent.name);
+    const branchName = cleanText(agent.branchName);
+
+    // Parse company name from displayName if it contains " - "
+    let companyName = cleanText(agent.companyName || agent.company);
+    let finalBranchName = branchName;
+
+    if (!companyName && displayName) {
+        if (displayName.includes(' - ')) {
+            const parts = displayName.split(' - ');
+            companyName = parts[0].trim();
+            finalBranchName = finalBranchName || parts.slice(1).join(' - ').trim() || companyName;
+        } else {
+            companyName = displayName;
+            finalBranchName = finalBranchName || displayName;
+        }
+    }
+
+    const name = displayName || branchName || companyName;
+    if (!name) return null;
+
     const displayAddress = cleanText(agent.displayAddress || agent.address);
 
-    if (!name) return null;
+    // Extract locality from address (usually the city/town after comma)
+    let locality = cleanText(agent.locality || agent.town || agent.city);
+    if (!locality && displayAddress) {
+        const addressParts = displayAddress.split(',').map(p => p.trim());
+        // Locality is usually the second-to-last part (before postcode)
+        if (addressParts.length >= 2) {
+            // Skip the postcode (last part usually)
+            const potentialLocality = addressParts[addressParts.length - 2] || addressParts[0];
+            if (potentialLocality && !/^[A-Z]{1,2}\d/.test(potentialLocality)) {
+                locality = potentialLocality;
+            }
+        }
+    }
+
+    // Extract logo URL properly (can be string or object with src/url)
+    let logoUrl = null;
+    if (agent.logo) {
+        if (typeof agent.logo === 'string') {
+            logoUrl = agent.logo;
+        } else if (typeof agent.logo === 'object') {
+            logoUrl = agent.logo.src || agent.logo.url || agent.logo.href || agent.logo.image || null;
+        }
+    }
+    // Ensure logo has proper extension or is a valid URL
+    if (logoUrl && typeof logoUrl === 'string') {
+        logoUrl = ensureAbsoluteUrl(logoUrl);
+        // If URL doesn't have an image extension but looks like a URL, keep it
+        // Some CDNs serve images without extensions
+    }
+
+    // Extract rating from various possible locations
+    const aggregateRating = agent.aggregateRating || agent.rating_info || {};
+    const rating = parseNumber(
+        agent.averageRating ||
+        agent.rating ||
+        agent.ratingValue ||
+        aggregateRating.ratingValue ||
+        aggregateRating.average ||
+        aggregateRating.rating
+    );
+
+    // Extract review count
+    const reviewCount = parseNumber(
+        agent.reviewCount ||
+        agent.reviewsCount ||
+        agent.numberOfReviews ||
+        aggregateRating.reviewCount ||
+        aggregateRating.ratingCount ||
+        aggregateRating.count
+    );
 
     return {
         agentId: agentId ? String(agentId) : null,
         name,
-        branchName: cleanText(agent.branchName) || name,
-        companyName: cleanText(agent.companyName || agent.company),
+        branchName: finalBranchName || name,
+        companyName,
         url: ensureAbsoluteUrl(agent.uriName ? `/find-agents/branch/${agent.uriName}/${agent.id}/` : agent.url),
         address: displayAddress,
         postalCode: extractUkPostcode(displayAddress),
-        locality: cleanText(agent.locality || agent.town),
+        locality,
         phone: normalizePhone(agent.contactNumber || agent.telephone || agent.phone),
         website: ensureAbsoluteUrl(agent.website),
-        logo: ensureAbsoluteUrl(agent.logo),
-        rating: parseNumber(agent.rating || agent.ratingValue),
-        reviewCount: parseNumber(agent.reviewCount),
+        logo: logoUrl,
+        rating,
+        reviewCount,
         listingsForSale: parseNumber(forSale.availableListings),
         listingsToRent: parseNumber(toRent.availableListings),
         avgAskingPrice: parseNumber(forSale.avgAskingPrice),
@@ -155,6 +227,7 @@ const normalizeZooplaAgent = (agent, source) => {
         source,
     };
 };
+
 
 // ============================================================================
 // JSON-LD EXTRACTION (Fallback)
